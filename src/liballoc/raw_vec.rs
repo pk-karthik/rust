@@ -165,6 +165,82 @@ impl<T, A: Alloc> RawVec<T, A> {
     }
 }
 
+/// Given a `current_capacity` and a desired `capacity_increase` returns a
+/// suitable capacity for the `RawVec` such that `suitable_capacity >=
+/// current_capacity + capacity_increase`.
+///
+/// # Panics
+///
+/// Panics on overflow if `current_capacity + capacity_increase >
+/// std::usize::MAX`.
+///
+///
+/// # Growth strategy
+///
+/// RawVec grows differently depending on:
+///
+/// - 1. initial size: grows from zero to at least 64 bytes;
+///   use `with_capacity` to avoid a growth from zero.
+///
+/// - 2. vector size:
+///   - small vectors (<= 4096 bytes) and large vectors (>= 4096 * 32 bytes)
+///   grow with a growth factor of 2x.
+///   - otherwise (medium-sized vectors) grow with a growth factor of 1.5x.
+///
+/// # Growth factor
+///
+/// Medium-sized vectors' growth-factor is chosen to allow reusing memory from
+/// previous allocations. Previously freed memory can be reused after
+///
+/// - 4 reallocations for a growth factor of 1.5x
+/// - 3 reallocations for a growth factor of 1.45x
+/// - 2 reallocations for a growth factor of 1.3x
+///
+/// Which one is better [is application
+/// dependent](https://stackoverflow.com/questions/1100311/
+/// what-is-the-ideal-growth-rate-for-a-dynamically-allocated-array),
+/// also some claim that [the golden ration (1.618) is
+/// optimal](https://crntaylor.wordpress.com/2011/07/15/
+/// optimal-memory-reallocation-and-the-golden-ratio/).
+/// The trade-off is having to wait for many reallocations to be able to
+/// reuse old memory.
+///
+/// Note: a factor of 2x _never_ allows reusing previously-freed memory.
+///
+#[inline(always)]
+fn amortized_new_capacity(elem_size: usize, current_capacity: usize,
+                          capacity_increase: usize) -> usize {
+    // Computes the capacity from the `current_capacity` following the
+    // growth-strategy. The function `alloc_guard` ensures that
+    // `current_capacity <= isize::MAX` so that `current_capacity * N` where `N
+    // <= 2` cannot overflow.
+    let growth_capacity = match current_capacity {
+        // Empty vector => at least 64 bytes
+        //
+        // [OLD]:
+        // 0 => if elem_size > (!0) / 8 { 1 } else { 4 },
+        // [NEW]:
+        // 0 => (64 / elem_size).max(1),
+        // [NEW 2]:
+        0 => (32 / elem_size).max(4),
+        //
+        // Small and large vectors (<= 4096 bytes, and >= 4096 * 32 bytes):
+        //
+        // FIXME: jemalloc specific behavior, allocators should provide a
+        // way to query the byte size of blocks that can grow inplace.
+        //
+        // jemalloc can never grow in place small blocks but blocks larger
+        // than or equal to 4096 bytes can be expanded in place:
+        c if c <  4096 / elem_size => 2 * c,
+        c if c > 4096 * 32 / elem_size => 2 * c,
+        // Medium sized vectors in the [4096, 4096 * 32) bytes range:
+        c => c / 2 * 3
+    };
+    cmp::max(growth_capacity,
+             current_capacity.checked_add(capacity_increase).unwrap())
+}
+
+
 impl<T> RawVec<T, Heap> {
     /// Reconstitutes a RawVec from a pointer, capacity.
     ///
@@ -439,19 +515,6 @@ impl<T, A: Alloc> RawVec<T, A> {
         }
     }
 
-    /// Calculates the buffer's new size given that it'll hold `used_cap +
-    /// needed_extra_cap` elements. This logic is used in amortized reserve methods.
-    /// Returns `(new_capacity, new_alloc_size)`.
-    fn amortized_new_size(&self, used_cap: usize, needed_extra_cap: usize) -> usize {
-        // Nothing we can really do about these checks :(
-        let required_cap = used_cap.checked_add(needed_extra_cap)
-            .expect("capacity overflow");
-        // Cannot overflow, because `cap <= isize::MAX`, and type of `cap` is `usize`.
-        let double_cap = self.cap * 2;
-        // `double_cap` guarantees exponential growth.
-        cmp::max(double_cap, required_cap)
-    }
-
     /// Ensures that the buffer contains at least enough space to hold
     /// `used_cap + needed_extra_cap` elements. If it doesn't already have
     /// enough capacity, will reallocate enough space plus comfortable slack
@@ -504,6 +567,8 @@ impl<T, A: Alloc> RawVec<T, A> {
     /// #   vector.push_all(&[1, 3, 5, 7, 9]);
     /// # }
     /// ```
+    #[inline]
+    #[cold]
     pub fn reserve(&mut self, used_cap: usize, needed_extra_cap: usize) {
         unsafe {
             // NOTE: we don't early branch on ZSTs here because we want this
@@ -517,8 +582,17 @@ impl<T, A: Alloc> RawVec<T, A> {
                 return;
             }
 
-            let new_cap = self.amortized_new_size(used_cap, needed_extra_cap);
+            let elem_size = mem::size_of::<T>();
+            let new_cap = amortized_new_capacity(elem_size,
+                                                 used_cap,
+                                                 needed_extra_cap);
 
+            let new_layout = match Layout::array::<T>(new_cap) {
+                Some(layout) => layout,
+                None => panic!("capacity overflow"),
+            };
+            let (_, usable_size) = self.a.usable_size(&new_layout);
+            let new_cap = usable_size / elem_size;
             let new_layout = match Layout::array::<T>(new_cap) {
                 Some(layout) => layout,
                 None => panic!("capacity overflow"),
@@ -576,7 +650,10 @@ impl<T, A: Alloc> RawVec<T, A> {
                 return false;
             }
 
-            let new_cap = self.amortized_new_size(used_cap, needed_extra_cap);
+            let elem_size = mem::size_of::<T>();
+            let new_cap = amortized_new_capacity(elem_size,
+                                                 used_cap,
+                                                 needed_extra_cap);
 
             // Here, `cap < used_cap + needed_extra_cap <= new_cap`
             // (regardless of whether `self.cap - used_cap` wrapped).
@@ -584,6 +661,12 @@ impl<T, A: Alloc> RawVec<T, A> {
 
             let ptr = self.ptr() as *mut _;
             let new_layout = Layout::new::<T>().repeat(new_cap).unwrap().0;
+            let (_, usable_size) = self.a.usable_size(&new_layout);
+            let new_cap = usable_size / elem_size;
+            let new_layout = match Layout::array::<T>(new_cap) {
+                Some(layout) => layout,
+                None => panic!("capacity overflow"),
+            };
             // FIXME: may crash and burn on over-reserve
             alloc_guard(new_layout.size());
             match self.a.grow_in_place(ptr, old_layout, new_layout) {
@@ -760,38 +843,79 @@ mod tests {
         v.reserve(50, 150); // (causes a realloc, thus using 50 + 150 = 200 units of fuel)
         assert_eq!(v.a.fuel, 250);
     }
-
+/*
     #[test]
-    fn reserve_does_not_overallocate() {
-        {
-            let mut v: RawVec<u32> = RawVec::new();
-            // First `reserve` allocates like `reserve_exact`
-            v.reserve(0, 9);
-            assert_eq!(9, v.cap());
-        }
+    fn amortized_new_capacity_tests() {
+        // empty vector:
+        assert_eq!(amortized_new_capacity(1, 0, 1), 64);
+        assert_eq!(amortized_new_capacity(64, 0, 1), 1);
+        assert_eq!(amortized_new_capacity(128, 0, 1), 1);
 
-        {
-            let mut v: RawVec<u32> = RawVec::new();
-            v.reserve(0, 7);
-            assert_eq!(7, v.cap());
-            // 97 if more than double of 7, so `reserve` should work
-            // like `reserve_exact`.
-            v.reserve(7, 90);
-            assert_eq!(97, v.cap());
-        }
+        // small vector:
+        assert_eq!(amortized_new_capacity(1, 2048, 1), 4096);  // 2x
 
-        {
-            let mut v: RawVec<u32> = RawVec::new();
-            v.reserve(0, 12);
-            assert_eq!(12, v.cap());
-            v.reserve(12, 3);
-            // 3 is less than half of 12, so `reserve` must grow
-            // exponentially. At the time of writing this test grow
-            // factor is 2, so new capacity is 24, however, grow factor
-            // of 1.5 is OK too. Hence `>= 18` in assert.
-            assert!(v.cap() >= 12 + 12 / 2);
-        }
+        // medium vector
+        assert_eq!(amortized_new_capacity(1, 5000, 1), 7500);  // 1.5x
+
+        // large vector
+        assert_eq!(amortized_new_capacity(1, 140000, 1), 280000);  // 2x
     }
 
+    #[test]
+    fn reserve_() {
+        // Allocation from empty vector:
+        {
+            let mut v: RawVec<u8> = RawVec::new();
+            assert_eq!(v.cap(), 0);
 
+            // empty vectors allocate at least 64 bytes
+            v.reserve(0, 63);
+            assert_eq!(v.cap(), 64);
+        }
+        {
+            let mut v: RawVec<u32> = RawVec::new();
+
+            // empty vectors allocate at least 64 bytes
+            v.reserve(0, 9);
+            assert_eq!(16, v.cap());
+        }
+        // Exponential growth:
+        {
+            let mut v: RawVec<u8> = RawVec::new();
+            assert_eq!(v.cap(), 0);
+
+            // empty vectors allocate at least 64 bytes
+            v.reserve(0, 1);
+            assert_eq!(v.cap(), 64);
+
+            // small vectors grow with a factor of two:
+            v.reserve(64, 1);
+            assert_eq!(v.cap(), 128);
+
+            // The required capacity is 128 + 3968 = 4096 which is larger than
+            // 2*128 = 256, so here `reserve` allocates "exactly" 4096 elements
+            // modulo extra size returned by the allocator:
+            v.reserve(128, 3968);
+            assert!(v.cap() >= 4096 && v.cap() <= 4096 + 128);
+
+            // 1 <= 1.5 * cap, so here the "medium" sized vector uses a growth
+            // factor of 1.5:
+            let cap = v.cap();
+            v.reserve(cap, 1);
+            assert!(v.cap() >= cap * 3 / 2 && v.cap() <= cap * 3 / 2 + 512);
+
+            // we reserve enough to make the vector "large"
+            let cap = v.cap();
+            v.reserve(cap, 4096 * 32);
+            assert!(v.cap() >= cap + 4096 * 32
+                    && v.cap() <= cap + 4096 * 40);
+
+            // large vectors grow with a growth-factor equals 2x:
+            let cap = v.cap();
+            v.reserve(cap, 1);
+            assert_eq!(v.cap(), cap * 2);
+            assert!(v.cap() >= cap * 2 && v.cap() <= cap * 2 + 4096);
+        }
+    }
+    */
 }
